@@ -1,0 +1,94 @@
+# HTTP request collection.
+#
+# Works with the VS Code REST Client extension and JetBrains HTTP Client.
+# Start the service first: `make run`
+
+@base = http://localhost:8000
+@apiKey = your-api-key-here
+
+### Liveness -- never depends on the model
+GET {{base}}/health
+
+### Readiness -- gates the load balancer
+GET {{base}}/ready
+
+### Model identity and live scheduler stats
+GET {{base}}/v1/meta
+
+### Prometheus metrics
+GET {{base}}/metrics
+
+### Single prediction -- positive
+POST {{base}}/v1/predict
+Content-Type: application/json
+
+{
+  "text": "this service is excellent and works perfectly"
+}
+
+### Single prediction -- negative
+POST {{base}}/v1/predict
+Content-Type: application/json
+
+{
+  "text": "absolutely terrible, a complete waste of money"
+}
+
+### Batch prediction
+POST {{base}}/v1/predict/batch
+Content-Type: application/json
+
+{
+  "texts": [
+    "fantastic quality and fast delivery",
+    "broke within a week, very disappointed",
+    "does the job, nothing special"
+  ]
+}
+
+### Client-supplied request id -- echoed back for distributed tracing
+POST {{base}}/v1/predict
+Content-Type: application/json
+X-Request-ID: my-trace-id-12345
+
+{
+  "text": "correlate this across services"
+}
+
+### With authentication (set api.api_keys or INFERENCE_API_KEYS first)
+POST {{base}}/v1/predict
+Content-Type: application/json
+X-API-Key: {{apiKey}}
+
+{
+  "text": "authenticated request"
+}
+
+### Validation error -- 422 with the standard envelope
+POST {{base}}/v1/predict
+Content-Type: application/json
+
+{
+}
+
+### Unknown field -- rejected, because schemas use extra="forbid"
+POST {{base}}/v1/predict
+Content-Type: application/json
+
+{
+  "txt": "a typo in the field name"
+}
+
+### Whitespace-only input -- rejected rather than scored meaninglessly
+POST {{base}}/v1/predict
+Content-Type: application/json
+
+{
+  "text": "     "
+}
+
+### Interactive documentation
+GET {{base}}/docs
+
+### OpenAPI schema -- generate clients from this
+GET {{base}}/openapi.json

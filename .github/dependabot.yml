@@ -1,0 +1,44 @@
+version: 2
+
+updates:
+  # FastAPI, Uvicorn and Pydantic ship in the runtime image, so a CVE here is a
+  # CVE in production. Weekly, grouped so the churn is reviewable.
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+    open-pull-requests-limit: 5
+    labels: [dependencies, python]
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      runtime:
+        patterns: ["fastapi", "uvicorn*", "pydantic*", "starlette", "prometheus-client"]
+      dev-tools:
+        patterns: ["ruff", "mypy", "pytest*", "httpx"]
+
+  # Pinned action versions are the supply-chain control that matters most: a
+  # compromised third-party action runs with this repository's token.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+    open-pull-requests-limit: 5
+    labels: [dependencies, ci]
+    commit-message:
+      prefix: "chore(ci)"
+
+  # The Alpine base image is where most image CVEs originate.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+    labels: [dependencies, docker]
+    commit-message:
+      prefix: "chore(docker)"

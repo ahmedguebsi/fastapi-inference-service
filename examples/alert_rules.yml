@@ -1,0 +1,158 @@
+# Alerting rules for the inference service.
+#
+# Principles behind these:
+#   * Alert on SYMPTOMS users feel (latency, errors, rejections), not on causes.
+#   * Separate "the service is broken" from "the service is saturated" -- they
+#     need different responses (page vs scale).
+#   * Backpressure (503 queue_full) is the design working, not a defect. It is
+#     worth alerting on because it means capacity is short, but it is a scaling
+#     signal, not a bug signal.
+#   * Use `for:` generously. A 30-second blip during a deploy is not an incident.
+
+groups:
+  # -------------------------------------------------------------------------
+  - name: inference-availability
+    interval: 15s
+    rules:
+      - alert: InferenceServiceDown
+        expr: up{job="inference-service"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          team: ml-platform
+        annotations:
+          summary: "inference-service unreachable on {{ $labels.instance }}"
+          description: "Prometheus cannot scrape the service. Check pod status and logs."
+
+      - alert: InferenceServiceNotReady
+        # Distinct from Down: the process is up and scrapeable but is telling us
+        # it cannot serve. Usually a failed model load or a stuck drain.
+        expr: inference_ready == 0
+        for: 5m
+        labels:
+          severity: critical
+          team: ml-platform
+        annotations:
+          summary: "inference-service on {{ $labels.instance }} is up but not ready"
+          description: >-
+            The process is running and scrapeable but reports not-ready, so the
+            load balancer has removed it. Check /ready and the startup logs for
+            a model load failure.
+
+      - alert: InferenceHighErrorRate
+        expr: |
+          sum(rate(inference_http_requests_total{status="5xx"}[5m]))
+            / sum(rate(inference_http_requests_total[5m])) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+          team: ml-platform
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of requests are failing"
+          description: >-
+            Note this includes 503s from backpressure. Check
+            inference_rejections_total to tell saturation apart from genuine
+            errors before paging an engineer to debug the model.
+
+      - alert: InferenceBackendErrors
+        # Exceptions inside the model itself -- always a real defect.
+        expr: rate(inference_inference_errors_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: critical
+          team: ml-platform
+        annotations:
+          summary: "Model backend raising {{ $labels.error_type }} on {{ $labels.instance }}"
+          description: "The model is throwing during inference. This is a code or artifact bug."
+
+  # -------------------------------------------------------------------------
+  - name: inference-saturation
+    interval: 15s
+    rules:
+      - alert: InferenceBackpressure
+        # The service is rejecting work because the queue is full. Working as
+        # designed, and a clear signal to add replicas.
+        expr: rate(inference_rejections_total{reason="queue_full"}[5m]) > 1
+        for: 5m
+        labels:
+          severity: warning
+          team: ml-platform
+        annotations:
+          summary: "inference-service is shedding load on {{ $labels.instance }}"
+          description: >-
+            The inference queue is full and requests are being rejected with
+            503. This is backpressure working correctly -- the service needs
+            more capacity. Scale replicas, or raise max_batch_size if the model
+            has headroom.
+
+      - alert: InferenceQueueDepthHigh
+        # Leading indicator: fires before rejections start.
+        expr: inference_queue_depth > 100
+        for: 10m
+        labels:
+          severity: warning
+          team: ml-platform
+        annotations:
+          summary: "Inference queue depth is {{ $value }} on {{ $labels.instance }}"
+          description: "Sustained queueing. Rejections will follow if load rises further."
+
+      - alert: InferenceTimeouts
+        expr: rate(inference_rejections_total{reason="timeout"}[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+          team: ml-platform
+        annotations:
+          summary: "Requests are exceeding their time budget on {{ $labels.instance }}"
+          description: >-
+            Either the model has slowed down or the queue is deep enough that
+            items expire before reaching it. Compare
+            inference_queue_wait_seconds with inference_batch_duration_seconds
+            to tell which.
+
+      - alert: InferenceHighLatency
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum by (le, endpoint) (rate(inference_http_request_duration_seconds_bucket[5m]))
+          ) > 1.0
+        for: 10m
+        labels:
+          severity: warning
+          team: ml-platform
+        annotations:
+          summary: "p99 latency on {{ $labels.endpoint }} is {{ $value | humanizeDuration }}"
+
+  # -------------------------------------------------------------------------
+  - name: inference-efficiency
+    interval: 1m
+    rules:
+      - alert: InferenceBatchingIneffective
+        # Mean batch size near 1 while the queue is deep means batching is not
+        # engaging -- historically caused by a window measured from the wrong
+        # instant, which makes throughput DEGRADE as load rises.
+        expr: |
+          (
+            rate(inference_batch_size_sum[10m]) / rate(inference_batch_size_count[10m]) < 1.5
+          ) and (inference_queue_depth > 20)
+        for: 15m
+        labels:
+          severity: warning
+          team: ml-platform
+        annotations:
+          summary: "Batching is not engaging on {{ $labels.instance }}"
+          description: >-
+            Mean batch size is near 1 while requests are queueing, so the
+            service is paying full fixed cost per item. Check max_wait_ms and
+            max_batch_size, and confirm the batch window logic.
+
+      - alert: InferenceModelChanged
+        # Not a failure -- but an unannounced model change during an incident is
+        # information you want immediately.
+        expr: changes(inference_model_info[1h]) > 0
+        labels:
+          severity: info
+          team: ml-platform
+        annotations:
+          summary: "Loaded model changed on {{ $labels.instance }}"
+          description: "Verify this was an intended deploy. Check /v1/meta for the artifact hash."

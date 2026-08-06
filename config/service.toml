@@ -1,0 +1,139 @@
+# inference-service configuration
+#
+# Installed to /etc/inference-service/service.toml, or found at ./config/service.toml.
+# Every value below is the built-in default.
+#
+# Precedence: defaults < this file < INFERENCE_* environment variables.
+# Unknown keys are a FATAL error, not a warning: a typo'd `max_batch_sze` must
+# never leave an operator believing they tuned throughput when they did not.
+
+service_name = "inference-service"
+environment = "development"
+
+[server]
+# 0.0.0.0 because containers must bind all interfaces to be reachable from
+# outside the network namespace. Exposure is controlled by the orchestrator's
+# port publishing and the security group, not by the bind address.
+host = "0.0.0.0"
+port = 8000
+
+# Processes, not threads. Each worker loads its OWN copy of the model and keeps
+# its OWN batch queue, so memory scales linearly and batches fill more slowly
+# because arrivals are split across queues. For model serving, prefer scaling
+# replicas over workers. The service logs a warning if this is > 1.
+workers = 1
+
+# MUST exceed the load balancer's idle timeout. If the server closes a
+# connection the LB still believes is open, clients see sporadic 502s that are
+# maddening to debug. AWS ALB defaults to 60s, so 65 is the conventional floor.
+keep_alive_timeout = 65
+
+# Upper bound on graceful shutdown. MUST be less than the orchestrator's kill
+# grace period (Kubernetes terminationGracePeriodSeconds, default 30s), or the
+# process is SIGKILLed mid-drain and in-flight requests are lost.
+graceful_shutdown_timeout = 30.0
+
+# How long to keep serving after readiness flips to false, BEFORE draining the
+# queue. This is the single most important setting for zero-downtime deploys.
+#
+# On SIGTERM the service marks itself not-ready immediately. The load balancer
+# only notices on its next readiness probe, and any request it routed just
+# before that still has to land. This delay is that grace window.
+#
+# Set it ABOVE your load balancer's readiness probe period:
+#   Kubernetes default probe period   10s  -> use 15
+#   AWS ALB health check interval  15-30s  -> use 35
+# Too low and you get 502s during rolling deploys. Too high and deploys crawl.
+prestop_delay_s = 5.0
+
+# Set when served behind a path-rewriting proxy, so generated OpenAPI URLs are
+# correct. e.g. "/api/inference"
+root_path = ""
+
+[model]
+backend = "linear"
+artifact_path = "models/sentiment-v1.json"
+
+# Run a throwaway inference at startup. Without it the first real request after
+# every deploy absorbs one-off initialisation cost and shows up as a p99 spike.
+warmup = true
+
+[batching]
+enabled = true
+
+# Upper bound on items per forward pass. Larger batches amortise fixed cost
+# better but raise tail latency and memory. Tune against your model's actual
+# throughput curve -- see docs/performance.md.
+max_batch_size = 32
+
+# THE latency/throughput dial.
+#
+# How long the scheduler waits, from the arrival of the FIRST item in a batch,
+# for more items to join it. This is the maximum latency batching can add.
+#
+#   Lower  -> smaller batches, lower latency, lower peak throughput
+#   Higher -> fuller batches, higher throughput, higher tail latency
+#
+# 10ms is a sane default for a model whose single-item inference is ~1ms.
+# For a slow model (50ms+), the fixed cost dominates and a larger window pays
+# for itself. For an ultra-low-latency path, set it to 0 to disable windowing.
+max_wait_ms = 10.0
+
+# Backpressure threshold. When the queue is full the service returns 503 with
+# Retry-After IMMEDIATELY rather than accepting work it cannot finish.
+#
+# An unbounded queue does not increase throughput under overload -- it converts
+# a fast, honest rejection into unbounded latency, memory growth, and an OOM
+# kill that also destroys the in-flight work.
+#
+# Rule of thumb: max_queue_size ~= peak_rps * request_timeout_s. Beyond that,
+# items would time out before reaching the model anyway.
+max_queue_size = 512
+
+# Per-request budget, covering queue wait plus inference.
+request_timeout_s = 10.0
+
+# How long shutdown waits for the queue to empty before abandoning it.
+# Must be under server.graceful_shutdown_timeout.
+drain_timeout_s = 30.0
+
+[api]
+max_texts_per_request = 64
+max_text_length = 4000
+
+# Empty disables authentication. Set INFERENCE_API_KEYS=key1,key2 in production
+# rather than committing keys here. Comparison is constant-time.
+api_keys = []
+
+# Empty disables CORS entirely, which is correct for a service called
+# server-to-server. Only populate for genuine browser clients.
+cors_origins = []
+
+# Swagger UI and the OpenAPI document. Convenient in development, unnecessary
+# surface in production where clients build against a published spec.
+docs_enabled = true
+
+[logging]
+level = "INFO"
+
+# "json" for production (any log backend parses it); "text" for a terminal.
+format = "json"
+
+# One structured line per request with route template, status, duration and
+# request id. Health and metrics endpoints are excluded automatically -- probe
+# traffic would otherwise drown out real requests.
+access_log = true
+
+# Request bodies contain user text. Off by default; enable only with a lawful
+# basis and a retention policy.
+log_request_body = false
+
+[observability]
+metrics_enabled = true
+metrics_path = "/metrics"
+
+# Histogram buckets are CUMULATIVE and each one is a time series. Too few and
+# quantiles are meaningless; too many and cardinality explodes. These are shaped
+# for a service targeting a ~100ms p99 -- dense where the action is, sparse in
+# the tail. Re-shape them if your latency profile differs.
+latency_buckets = [0.001, 0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]

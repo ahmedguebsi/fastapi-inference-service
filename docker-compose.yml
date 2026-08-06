@@ -1,0 +1,126 @@
+# Demonstration stack: the service, Prometheus, and Grafana.
+#
+#   docker compose up --build -d
+#   curl localhost:8000/v1/predict -H 'Content-Type: application/json' \
+#        -d '{"text":"this is excellent"}'
+#   open http://localhost:9090   Prometheus
+#   open http://localhost:3000   Grafana (anonymous admin)
+
+name: inference-service
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: inference-service:local
+    container_name: inference-service
+    restart: unless-stopped
+
+    ports:
+      - "127.0.0.1:8000:8000"
+
+    environment:
+      INFERENCE_ENVIRONMENT: docker
+      INFERENCE_LOG_FORMAT: json
+      INFERENCE_LOG_LEVEL: INFO
+      INFERENCE_MAX_BATCH_SIZE: "32"
+      INFERENCE_MAX_WAIT_MS: "10"
+      INFERENCE_MAX_QUEUE_SIZE: "512"
+      # No load balancer in front of this stack, so there is nothing to wait for
+      # deregistration from. In Kubernetes or behind an ALB, raise this ABOVE
+      # the readiness probe period (see config/service.toml).
+      INFERENCE_PRESTOP_DELAY_S: "0"
+
+    # MUST exceed prestop_delay_s + drain_timeout_s, or Docker SIGKILLs the
+    # container mid-drain and in-flight requests are lost. Docker's default is
+    # only 10s, which the service's own defaults exceed -- this is the most
+    # common way a correct graceful shutdown gets silently defeated.
+    stop_grace_period: 45s
+
+    # Ensures SIGTERM reaches PID 1 and reaps zombies. The image already uses
+    # exec form so the service *is* PID 1, but init costs nothing and protects
+    # against a future entrypoint change.
+    init: true
+
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import sys, urllib.request
+          sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/ready', timeout=4).status == 200 else 1)
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1.0"
+        reservations:
+          memory: 128M
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: inference-prometheus
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./examples/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./examples/alert_rules.yml:/etc/prometheus/alert_rules.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+      - --web.enable-lifecycle
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: inference-grafana
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      # Demo stack only. Never do this anywhere real.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./examples/grafana-datasource.yml:/etc/grafana/provisioning/datasources/prometheus.yml:ro
+      - grafana-data:/var/lib/grafana
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  prometheus-data:
+  grafana-data:

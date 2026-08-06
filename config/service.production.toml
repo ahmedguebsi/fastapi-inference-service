@@ -1,0 +1,86 @@
+# Worked production configuration.
+#
+# Differences from the shipped default (config/service.toml), with reasoning.
+# Deploy by mounting this at /etc/inference-service/service.toml, or by setting
+# the equivalent INFERENCE_* variables -- prefer the latter, so one image runs
+# in every environment without a rebuild.
+
+service_name = "inference-service"
+environment = "production"
+
+[server]
+host = "0.0.0.0"
+port = 8000
+
+# One worker per container. Each worker is a separate process with its own model
+# copy AND its own batch queue, so memory scales linearly while batches fill
+# more slowly -- you pay twice. Scale with replicas instead.
+workers = 1
+
+# Must exceed the load balancer's idle timeout, or the server closes connections
+# the LB still believes are open and clients see intermittent 502s with no
+# corresponding server log. ALB defaults to 60s.
+keep_alive_timeout = 65
+
+graceful_shutdown_timeout = 40.0
+
+# Raised from the default 5s to sit above a Kubernetes readiness probe period
+# of 10s. This is the window in which the LB notices we are not ready and stops
+# routing, while we are still fully able to serve what it already sent.
+#
+# REQUIRED: terminationGracePeriodSeconds (or --stop-timeout / stop_grace_period)
+# must exceed prestop_delay_s + drain_timeout_s = 15 + 25 = 40s. Use 45.
+prestop_delay_s = 15.0
+
+root_path = ""
+
+[model]
+backend = "linear"
+artifact_path = "/opt/inference-service/models/sentiment-v1.json"
+warmup = true
+
+[batching]
+enabled = true
+
+# Tuned against the model's measured single-item latency. See
+# docs/performance.md -- raise until p99 rises faster than throughput.
+max_batch_size = 32
+max_wait_ms = 10.0
+
+# Roughly peak_rps * request_timeout_s. Beyond that, items expire in the queue
+# before reaching the model, so a deeper queue only delays the rejection.
+max_queue_size = 512
+
+# Below the client's timeout, so callers get a clean 504 with a request id
+# rather than an opaque connection reset.
+request_timeout_s = 10.0
+
+drain_timeout_s = 25.0
+
+[api]
+max_texts_per_request = 64
+max_text_length = 4000
+
+# Set via INFERENCE_API_KEYS from a secret manager. Never commit keys.
+api_keys = []
+
+# Empty disables CORS, which is correct for a service called server-to-server.
+cors_origins = []
+
+# Unnecessary attack surface in production; clients build against the OpenAPI
+# schema published by CI, not against a live /docs page.
+docs_enabled = false
+
+[logging]
+level = "INFO"
+format = "json"
+access_log = true
+
+# Request bodies contain user text. Enable only with a lawful basis and a
+# retention policy.
+log_request_body = false
+
+[observability]
+metrics_enabled = true
+metrics_path = "/metrics"
+latency_buckets = [0.001, 0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]

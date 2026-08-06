@@ -1,0 +1,27 @@
+# Shell scripts and Dockerfiles are consumed by Linux and MUST use LF, whatever
+# platform they were authored on. A CRLF in a file with a shebang produces the
+# notoriously confusing:
+#   /bin/bash^M: bad interpreter: No such file or directory
+* text=auto eol=lf
+
+*.sh          text eol=lf
+*.bash        text eol=lf
+Makefile      text eol=lf
+Dockerfile    text eol=lf
+*.py          text eol=lf
+*.toml        text eol=lf
+*.yml         text eol=lf
+*.yaml        text eol=lf
+*.md          text eol=lf
+*.http        text eol=lf
+
+# The model artifact is compared byte-for-byte by CI to prove it is
+# reproducible from scripts/train_model.py. Any newline translation would
+# break that check on a cross-platform checkout.
+models/*.json text eol=lf
+
+*.png         binary
+*.jpg         binary
+*.gz          binary
+
+docs/*.md     linguist-documentation

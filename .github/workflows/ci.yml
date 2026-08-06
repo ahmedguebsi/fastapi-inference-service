@@ -1,0 +1,354 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "23 6 * * 1"
+  workflow_dispatch:
+
+# Default to nothing and grant per job, so a compromised action cannot push
+# code or publish packages.
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.13"
+  FORCE_COLOR: "1"
+  # Enforced in two places: the container job below and `make docker-size`.
+  SIZE_BUDGET_MB: "200"
+
+jobs:
+  # -------------------------------------------------------------------------
+  lint:
+    name: Format and lint
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - run: uv python install ${{ env.PYTHON_VERSION }}
+      - run: uv pip install --system -e ".[dev]"
+      - run: ruff format --check --diff src tests scripts
+      - run: ruff check --output-format=github src tests scripts
+
+  # -------------------------------------------------------------------------
+  typecheck:
+    name: Type check
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - run: uv python install ${{ env.PYTHON_VERSION }}
+      - run: uv pip install --system -e ".[dev]"
+      - run: mypy src
+
+  # -------------------------------------------------------------------------
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - run: uv python install ${{ env.PYTHON_VERSION }}
+      - run: uv pip install --system -e ".[dev]"
+
+      - name: Run tests
+        run: pytest --cov --cov-report=xml --cov-report=term-missing -v
+
+      - name: Upload coverage
+        if: matrix.os == 'ubuntu-24.04'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.xml
+          retention-days: 7
+
+  # -------------------------------------------------------------------------
+  model-reproducibility:
+    name: Model artifact is reproducible
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - run: uv python install ${{ env.PYTHON_VERSION }}
+      - run: uv pip install --system -e "."
+
+      # The committed weights must be reproducible from the training script, or
+      # they are magic numbers nobody can audit or regenerate.
+      - name: Retrain and compare
+        run: |
+          before=$(sha256sum models/sentiment-v1.json | cut -d' ' -f1)
+          python scripts/train_model.py
+          after=$(sha256sum models/sentiment-v1.json | cut -d' ' -f1)
+          echo "committed: $before"
+          echo "retrained: $after"
+          if [ "$before" != "$after" ]; then
+            echo "::error::the committed model artifact is not reproducible from scripts/train_model.py"
+            git diff --stat models/
+            exit 1
+          fi
+          echo "model artifact is byte-reproducible"
+
+  # -------------------------------------------------------------------------
+  api-contract:
+    name: OpenAPI schema
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - run: uv python install ${{ env.PYTHON_VERSION }}
+      - run: uv pip install --system -e ".[dev]"
+
+      - name: Generate and validate the OpenAPI schema
+        run: |
+          python - <<'PY'
+          import json, sys
+          from inference_service.main import create_app
+
+          schema = create_app().openapi()
+          paths = schema["paths"]
+
+          required = ["/v1/predict", "/v1/predict/batch", "/health", "/ready", "/v1/meta"]
+          missing = [p for p in required if p not in paths]
+          if missing:
+              print(f"::error::OpenAPI schema is missing paths: {missing}")
+              sys.exit(1)
+
+          # Documented failure modes are part of the contract: a generated
+          # client needs to know 503 and 504 are expected, not exceptional.
+          predict = paths["/v1/predict"]["post"]["responses"]
+          for code in ("422", "503", "504"):
+              if code not in predict:
+                  print(f"::error::/v1/predict does not document a {code} response")
+                  sys.exit(1)
+
+          with open("openapi.json", "w") as fh:
+              json.dump(schema, fh, indent=2)
+          print(f"OpenAPI schema valid: {len(paths)} paths")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openapi
+          path: openapi.json
+          retention-days: 30
+
+  # -------------------------------------------------------------------------
+  shell:
+    name: Shell scripts
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: ShellCheck
+        uses: ludeeus/action-shellcheck@master
+        env:
+          SHELLCHECK_OPTS: --severity=style --external-sources
+        with:
+          scandir: ./scripts
+
+  # -------------------------------------------------------------------------
+  security:
+    name: Security scan
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: sarif
+          output: trivy-fs.sarif
+          severity: HIGH,CRITICAL
+
+      - uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-fs.sarif
+          category: trivy-fs
+
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # -------------------------------------------------------------------------
+  docker:
+    name: Container
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: inference-service:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Enforce the image size budget
+        run: |
+          size=$(docker image inspect inference-service:ci --format '{{.Size}}')
+          human=$(awk -v s="$size" 'BEGIN {printf "%.1f MB", s/1000/1000}')
+          budget=$(( ${{ env.SIZE_BUDGET_MB }} * 1000 * 1000 ))
+          echo "Image size: $human (budget ${{ env.SIZE_BUDGET_MB }} MB)"
+          if [ "$size" -gt "$budget" ]; then
+            echo "::error::image is $human, over the ${{ env.SIZE_BUDGET_MB }} MB budget"
+            exit 1
+          fi
+
+      - name: Verify the container is unprivileged
+        run: |
+          uid=$(docker run --rm --entrypoint python inference-service:ci -c 'import os; print(os.getuid())')
+          echo "container uid: $uid"
+          if [ "$uid" = "0" ]; then
+            echo "::error::container runs as root"
+            exit 1
+          fi
+
+      - name: Verify no shell for the runtime user
+        run: |
+          # Defence in depth: even with code execution, no interactive shell.
+          shell=$(docker run --rm --entrypoint python inference-service:ci \
+            -c "import pwd,os; print(pwd.getpwuid(os.getuid()).pw_shell)")
+          echo "runtime user shell: $shell"
+          case "$shell" in *nologin|*false) ;; *) echo "::error::runtime user has a login shell"; exit 1;; esac
+
+      - name: Start the container
+        run: |
+          docker run -d --name svc -p 8000:8000 \
+            --stop-timeout 45 \
+            -e INFERENCE_PRESTOP_DELAY_S=1 \
+            inference-service:ci
+          for attempt in $(seq 1 60); do
+            if curl -sf http://localhost:8000/ready >/dev/null 2>&1; then
+              echo "ready after ${attempt}s"; break
+            fi
+            if [ "$attempt" = "60" ]; then
+              echo "::error::service never became ready"
+              docker logs svc
+              exit 1
+            fi
+            sleep 1
+          done
+
+      - name: Smoke test
+        run: ./scripts/smoke_test.sh http://localhost:8000
+
+      - name: Verify graceful shutdown drains rather than being killed
+        run: |
+          # A SIGKILL (exit 137) means in-flight requests were dropped. This is
+          # the single most important container-level behaviour to assert.
+          start=$(date +%s)
+          docker stop svc >/dev/null
+          elapsed=$(( $(date +%s) - start ))
+          code=$(docker inspect svc --format '{{.State.ExitCode}}')
+          echo "stopped in ${elapsed}s with exit code ${code}"
+
+          if [ "$code" != "0" ]; then
+            echo "::error::container did not shut down cleanly (exit ${code}; 137 = SIGKILL)"
+            docker logs svc | tail -30
+            exit 1
+          fi
+          docker logs svc 2>&1 | grep -q "shutdown complete" || {
+            echo "::error::shutdown sequence did not complete"
+            docker logs svc | tail -30
+            exit 1
+          }
+          docker rm -f svc >/dev/null 2>&1 || true
+
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: inference-service:ci
+          format: sarif
+          output: trivy-image.sarif
+          severity: HIGH,CRITICAL
+
+      - uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-image
+
+  # -------------------------------------------------------------------------
+  load:
+    name: Batching effectiveness
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - run: uv python install ${{ env.PYTHON_VERSION }}
+      - run: uv pip install --system -e "."
+
+      # Regression guard for a real bug: measuring the batch window from the
+      # head item's ENQUEUE time instead of from batch formation made batching
+      # collapse under load (66 rps instead of 1791). A unit test covers the
+      # mechanism; this asserts the end-to-end throughput property.
+      - name: Assert batching improves throughput under load
+        run: |
+          python scripts/benchmark.py \
+            --requests 800 --concurrency 64 --model-delay-ms 15 | tee bench.txt
+          speedup=$(grep -oP 'vs no batching: \K[0-9.]+' bench.txt)
+          echo "measured speedup: ${speedup}x"
+          if awk -v s="$speedup" 'BEGIN {exit !(s < 5)}'; then
+            echo "::error::batching speedup was only ${speedup}x; expected >= 5x. Batching has regressed."
+            exit 1
+          fi
+
+  # -------------------------------------------------------------------------
+  ci-passed:
+    name: CI passed
+    runs-on: ubuntu-24.04
+    needs:
+      [lint, typecheck, test, model-reproducibility, api-contract, shell, security, docker, load]
+    if: always()
+    steps:
+      # One required status check for branch protection. Without this, adding a
+      # job silently makes it non-blocking.
+      - name: Verify every job succeeded
+        run: |
+          if echo '${{ toJSON(needs) }}' | grep -q '"result": *"failure"'; then
+            echo "::error::one or more CI jobs failed"; exit 1
+          fi
+          if echo '${{ toJSON(needs) }}' | grep -q '"result": *"cancelled"'; then
+            echo "::error::one or more CI jobs were cancelled"; exit 1
+          fi
+          echo "All CI jobs passed."
