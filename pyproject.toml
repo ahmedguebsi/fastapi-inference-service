@@ -29,9 +29,9 @@ classifiers = [
 #   prometheus-client  - correct exposition, multiprocess mode, exemplars
 # Notably ABSENT: numpy, torch, onnxruntime. See docs/architecture.md.
 dependencies = [
-    "fastapi>=0.115",
-    "uvicorn[standard]>=0.32",
-    "prometheus-client>=0.21",
+    "fastapi>=0.141.1",
+    "uvicorn[standard]>=0.52.1",
+    "prometheus-client>=0.26.0",
 ]
 
 [project.optional-dependencies]
