@@ -34,7 +34,7 @@
 # ---------------------------------------------------------------------------
 # Stage 1: builder
 # ---------------------------------------------------------------------------
-FROM python:3.13-alpine AS builder
+FROM python:3.14-alpine AS builder
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -67,7 +67,7 @@ RUN python -m venv /opt/venv \
 # ---------------------------------------------------------------------------
 # Stage 2: runtime
 # ---------------------------------------------------------------------------
-FROM python:3.13-alpine AS runtime
+FROM python:3.14-alpine AS runtime
 
 LABEL org.opencontainers.image.title="inference-service" \
       org.opencontainers.image.description="FastAPI text classification inference service with dynamic batching" \
